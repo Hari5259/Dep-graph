@@ -24,6 +24,8 @@ const GOLD: [string, string, string][] = [
 const ANTI: [string, string, string][] = [
   ["GITHUB_CREATE_AN_ISSUE_COMMENT", "GITHUB_UPDATE_AN_ISSUE", "issue_number"],
   ["GITHUB_MERGE_A_PULL_REQUEST", "GITHUB_GET_A_PULL_REQUEST", "pull_number"],
+  ["GITHUB_LIST_GIST_COMMENTS", "GITHUB_UPDATE_AN_ISSUE_COMMENT", "comment_id"],
+  ["GITHUB_LIST_COMMIT_COMMENTS_FOR_A_REPOSITORY", "GITHUB_UPDATE_AN_ISSUE_COMMENT", "comment_id"],
 ];
 
 const g = JSON.parse(fs.readFileSync(process.argv[2] || "dependency_graph.json", "utf8"));

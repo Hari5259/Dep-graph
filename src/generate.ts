@@ -39,6 +39,7 @@ interface Tool {
   scope: string[];                  // resource tokens after it (for a repository ...)
   primaries: string[];              // entities this tool is "about"
   service: string;
+  quals: string[];                  // qualifiers of its entity: "gist" in LIST_GIST_COMMENTS
 }
 interface Edge { from: string; to: string; label: string; score: number; evidence: string; required: boolean }
 interface Ref { param: Param; entity: string | null; via: string }
@@ -158,7 +159,7 @@ function normalise(raw: Json): { tools: Tool[]; prefix: string } {
     ["data", "successful", "error", "success", "response_data"].forEach((k) => outputFields.delete(k));
     return {
       id: slugs[i], description: String(t.description || t.display_name || t.name || ""),
-      params, outputFields, tokens: [], verb: "", head: [], scope: [], primaries: [], service: "",
+      params, outputFields, tokens: [], verb: "", head: [], scope: [], primaries: [], service: "", quals: [],
     };
   }).filter((t) => t.id);
   return { tools, prefix: usePrefix };
@@ -232,6 +233,15 @@ function parseSlugs(tools: Tool[], prefix: string) {
   });
   const cThresh = Math.max(3, Math.min(8, Math.round(allPrim.size * 0.15)));
   const isContainer = (w: string) => (coOcc.get(w)?.size || 0) >= cThresh;
+  // for qualifiers, a container is a noun used mostly as scope ("for a repository", "for the authenticated user")
+  const hc = new Map<string, number>(), sc = new Map<string, number>();
+  tools.forEach((t) => { t.head.forEach((w) => hc.set(w, (hc.get(w) || 0) + 1)); t.scope.forEach((w) => sc.set(w, (sc.get(w) || 0) + 1)); });
+  const scopeNoun = (w: string) => { const a = sc.get(w) || 0, b = hc.get(w) || 0; return a >= 3 && a / (a + b) >= 0.5; };
+  tools.forEach((t) => {
+    const primTok = new Set(t.primaries.flatMap((p) => p.split("_")));
+    t.quals = [...new Set([...t.head, ...t.scope].filter((w) => !scopeNoun(w) && w !== "and" && w !== "or")
+      .flatMap((w) => w.split("_")).filter((w) => !primTok.has(w) && w.length > 2))];
+  });
   tools.forEach((t) => {
     const cands = t.head.filter((w) => w !== "and" && w !== "or");
     const pick = cands.find((w) => !isContainer(w)) || cands[cands.length - 1] || t.scope[0] || "misc";
@@ -324,6 +334,14 @@ function candidateProducers(consumer: Tool, ref: Ref, tools: Tool[], entities: M
     // the head should be exactly the entity; extra qualifiers ("assigned", "starred") make it narrower
     s -= 0.04 * Math.max(0, t.head.length - 1);
     if (t.scope.length && !t.scope.every((w) => consumer.tokens.includes(w) || consumerParams.has(w))) s -= 0.08;
+    // a qualified producer ("gist comments", "review comments") whose qualifiers the consumer never mentions
+    // lists a different kind of that entity
+    if (t.quals.length) {
+      const ctoks = new Set([...consumer.tokens.flatMap((w) => w.split("_")), ...[...consumerParams].flatMap((w) => w.split("_"))]);
+      // abbreviations count: param "repo" covers qualifier "repository", "org" covers "organization"
+      const covered = (q: string) => [...ctoks].some((c) => c === q || (c.length >= 3 && (q.startsWith(c) || c.startsWith(q))));
+      if (!t.quals.every(covered)) s -= 0.45;
+    }
     const prev = out.get(t.id);
     if (!prev || prev.score < s) out.set(t.id, { tool: t, score: +s.toFixed(3), evidence });
   };
