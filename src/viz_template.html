@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tool Dependency Graph</title>
+<script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+<style>
+  :root { --bg:#f7f7f5; --panel:#ffffff; --ink:#1d1d1b; --muted:#6b6b66; --line:#e2e2dc; --accent:#2f6fde; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#141413; --panel:#1e1e1c; --ink:#ececea; --muted:#9a9a94; --line:#33332f; --accent:#6c9cf0; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--ink); display:grid; grid-template-columns:320px 1fr; height:100vh; }
+  aside { background:var(--panel); border-right:1px solid var(--line); padding:16px; overflow:auto; }
+  h1 { font-size:16px; margin:0 0 4px; }
+  .muted { color:var(--muted); font-size:12px; }
+  label { display:block; font-size:12px; color:var(--muted); margin:14px 0 4px; }
+  input[type=text], select { width:100%; padding:7px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--ink); }
+  .row { display:flex; gap:8px; align-items:center; margin-top:8px; font-size:13px; }
+  #net { height:100vh; }
+  #detail { margin-top:16px; border-top:1px solid var(--line); padding-top:12px; font-size:13px; word-break:break-word; }
+  #detail code { font-size:12px; background:var(--bg); padding:1px 4px; border-radius:4px; }
+  #detail ul { padding-left:18px; margin:4px 0; }
+  .stat { display:inline-block; margin-right:12px; }
+  button { margin-top:10px; padding:6px 10px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--ink); cursor:pointer; }
+  @media (max-width: 700px) { body { grid-template-columns:1fr; grid-template-rows:auto 70vh; } #net { height:70vh; } aside { max-height:none; } }
+</style>
+</head>
+<body>
+<aside>
+  <h1>Tool Dependency Graph</h1>
+  <div class="muted" id="meta"></div>
+  <label for="q">Find a tool</label>
+  <input id="q" type="text" list="slugs" placeholder="e.g. MERGE_A_PULL_REQUEST">
+  <datalist id="slugs"></datalist>
+  <label for="svc">Service</label>
+  <select id="svc"><option value="">All services</option></select>
+  <div class="row"><input type="checkbox" id="ctx"><span>Show context edges (owner, repo ...)</span></div>
+  <div class="row"><input type="checkbox" id="iso"><span>Show tools with no edges</span></div>
+  <button id="reset">Reset view</button>
+  <div id="detail" class="muted">Click a node to see what it needs and what it unlocks. Edges point producer &rarr; consumer; the label is the field supplied.</div>
+</aside>
+<div id="net"></div>
+<script>
+const G = /*__GRAPH__*/null;
+const $ = (id) => document.getElementById(id);
+const freq = {}; G.nodes.forEach(n => Object.keys(n.requires_from_actions).forEach(p => freq[p] = (freq[p]||0)+1));
+const ctxLabels = new Set(Object.keys(freq).filter(p => freq[p] / G.nodes.length > 0.2));
+const services = [...new Set(G.nodes.map(n => n.service))].sort();
+const palette = ["#2f6fde","#d9534f","#2e9d6a","#b8860b","#8e44ad","#16a2b8","#e67e22","#5d6d7e","#c0392b","#27ae60","#7f8c8d","#d35400","#1abc9c","#9b59b6","#34495e","#f39c12"];
+const colorOf = s => palette[services.indexOf(s) % palette.length];
+$("meta").innerHTML = `<span class="stat">${G.stats.tools} tools</span><span class="stat">${G.stats.edges} edges</span><span class="stat">${G.stats.services} services</span>`;
+services.forEach(s => $("svc").insertAdjacentHTML("beforeend", `<option>${s}</option>`));
+G.nodes.forEach(n => $("slugs").insertAdjacentHTML("beforeend", `<option value="${n.id}">`));
+const prefix = (G.toolkit && G.toolkit !== "unknown") ? G.toolkit + "_" : "";
+const short = id => id.startsWith(prefix) ? id.slice(prefix.length) : id;
+
+const nodes = new vis.DataSet(), edges = new vis.DataSet();
+const net = new vis.Network($("net"), { nodes, edges }, {
+  physics: { solver: "forceAtlas2Based", forceAtlas2Based: { gravitationalConstant: -60, springLength: 120 }, stabilization: { iterations: 250 } },
+  nodes: { shape: "dot", size: 10, font: { size: 11, color: getComputedStyle(document.body).color } },
+  edges: { arrows: { to: { enabled: true, scaleFactor: .5 } }, smooth: { type: "continuous" }, font: { size: 9, align: "middle", strokeWidth: 0, color: "#888" }, color: { opacity: .55 } },
+  interaction: { hover: true, tooltipDelay: 120 },
+});
+
+function render(focus) {
+  const svc = $("svc").value, showCtx = $("ctx").checked, showIso = $("iso").checked;
+  let E = G.edges.filter(e => showCtx || !ctxLabels.has(e.label));
+  let keep;
+  if (focus) {
+    // upstream chain + direct downstream of the focused tool
+    keep = new Set([focus]); let frontier = [focus];
+    for (let d = 0; d < 3; d++) { const nx = []; E.forEach(e => { if (frontier.includes(e.to) && !keep.has(e.from)) { keep.add(e.from); nx.push(e.from); } }); frontier = nx; }
+    E.forEach(e => { if (e.from === focus) keep.add(e.to); });
+    E = E.filter(e => keep.has(e.from) && keep.has(e.to));
+  } else if (svc) {
+    E = E.filter(e => nodeById[e.from].service === svc || nodeById[e.to].service === svc);
+  }
+  const used = new Set(E.flatMap(e => [e.from, e.to]));
+  const N = G.nodes.filter(n => focus ? keep.has(n.id) : (used.has(n.id) || (showIso && (!svc || n.service === svc))));
+  nodes.clear(); edges.clear();
+  nodes.add(N.map(n => ({ id: n.id, label: short(n.id), color: colorOf(n.service), size: n.id === focus ? 18 : 8 + Math.min(10, E.filter(e => e.from === n.id).length),
+    title: `${n.id}\nservice: ${n.service}` })));
+  edges.add(E.map((e, i) => ({ id: i, from: e.from, to: e.to, label: e.label, title: `${e.label}  (score ${e.score}, ${e.evidence})`, dashes: e.evidence === "llm" })));
+}
+const nodeById = Object.fromEntries(G.nodes.map(n => [n.id, n]));
+
+function detail(id) {
+  const n = nodeById[id]; if (!n) return;
+  const needs = Object.entries(n.requires_from_actions).map(([p, l]) => `<li><code>${p}</code> &larr; ${l.map(short).join(", ")}</li>`).join("") || "<li>none</li>";
+  const unlocks = [...new Set(G.edges.filter(e => e.from === id).map(e => `${short(e.to)} (${e.label})`))];
+  $("detail").className = "";
+  $("detail").innerHTML = `<b>${n.id}</b><div class="muted">${n.service} &middot; ${n.verb} ${n.entity}</div>
+    <p><b>Get first from actions</b><ul>${needs}</ul></p>
+    <p><b>Ask the user for</b><ul>${n.requires_from_user.map(p => `<li><code>${p}</code></li>`).join("") || "<li>nothing</li>"}</ul></p>
+    <p><b>Unlocks</b> (${unlocks.length})<ul>${unlocks.slice(0, 25).map(u => `<li>${u}</li>`).join("") || "<li>none</li>"}</ul></p>`;
+}
+net.on("click", p => { if (p.nodes[0]) { detail(p.nodes[0]); render(p.nodes[0]); } });
+$("q").addEventListener("change", e => { const id = e.target.value.trim(); if (nodeById[id]) { detail(id); render(id); } });
+["svc", "ctx", "iso"].forEach(k => $(k).addEventListener("change", () => render()));
+$("reset").onclick = () => { $("q").value = ""; $("svc").value = ""; render(); };
+render();
+</script>
+</body>
+</html>
