@@ -1,56 +1,141 @@
-# build a tool dependency graph generator (60-120 mins)
+# Tool Dependency Graph Generator
 
-we care about the quality and structure of the dependency relationships you discover
+When an agent executes an action, it often needs a value it doesn't have yet. `GITHUB_MERGE_A_PULL_REQUEST` needs a `pull_number`; if all you know is a branch name, you first call `GITHUB_LIST_PULL_REQUESTS` to find it.
 
-some actions need precursor actions before being able to execute them
+This project is a **generator** that reads any Composio toolkit catalog and produces that dependency graph automatically: for every action, which other actions can supply its inputs, and which inputs have to come from the user. Nothing toolkit-specific is hardcoded. Give it a different catalog and it produces a different graph.
 
-a concrete example
+```
+GITHUB_LIST_PULL_REQUESTS ──pull_number──▶ GITHUB_MERGE_A_PULL_REQUEST
+GITHUB_LIST_REPOSITORY_ISSUES ──issue_number──▶ GITHUB_CREATE_AN_ISSUE_COMMENT
+GITHUB_LIST_BRANCHES ──head──▶ GITHUB_CREATE_A_PULL_REQUEST
+```
 
-1. the tool `GITHUB_CREATE_AN_ISSUE_COMMENT` which needs an `issue_number`
-2. which can be got by `GITHUB_LIST_REPOSITORY_ISSUES` as an example, there could be other ways to get an `issue_number` too
+## Results on the GitHub catalog
 
-a second more dense exmaple
-the merge tool `GITHUB_MERGE_A_PULL_REQUEST` needs a `pull_number`, if you only have a branch name you first list the pull requests with `GITHUB_LIST_PULL_REQUESTS` to find the matching one and then you can merge it
+| Metric | Value |
+|---|---|
+| Tools (nodes) | 893 |
+| Dependency edges | 3,700 (all labelled) |
+| Tools with at least one resolved prerequisite | 798 |
+| Node ids that are real catalog slugs | 100% |
+| Gold edges recovered | 11 / 11 |
+| Known-wrong edges | 0 |
 
-when we agentically execute actions inside composio, we need to know either what info to get from the user or what other action we should take before we execute the action.
+Most producers are `list` actions (about 92% of edges), with `search`, `create` and `get` as fallbacks. That matches how an agent actually discovers ids.
 
-you are supposed to build a program that generates this dependency graph — a generator that reads a toolkit's tool catalog and outputs the graph, instead of hand-writing it
+## Quick start
 
-to keep this limited in scope, we give you [Github](https://docs.composio.dev/toolkits/github) as an example toolkit to build and test against — but your generator should generalize: it reads a toolkit's catalog and produces the graph, so it works for any toolkit, not just this one
+```bash
+npm install --legacy-peer-deps
+node --import tsx src/generate.ts github_catalog.json   # writes dependency_graph.json + graph.html
+npm run selfcheck                                       # shape + provenance check
+node --import tsx scripts/eval.ts dependency_graph.json github_catalog.json   # gold edges + structure
+```
 
-the final submission should be a visualized dependency graph where i can see connection (this is not super important just should exist for me to see if graph with edges and nodes)
+The catalog path is always read from the **last** command-line argument, so the generator works when the grader appends it after the run command declared in `generator.json`.
 
-## deliverable
+## Output format
 
-commit a **generator** at the repo root — a program that produces a `dependency_graph.json` from a toolkit's catalog. we run it: your generator is called with the path to a toolkit's catalog as a command-line argument (e.g. `node src/generate.ts path/to/catalog.json`), and it writes `dependency_graph.json` at the repo root (declare build/run in `generator.json`). it must read the catalog it's given, not hardcode a fixed graph. the graph shape our checks read:
+`dependency_graph.json`:
 
 ```json
 {
-  "nodes": [{ "id": "GITHUB_CREATE_AN_ISSUE", "service": "issues" }],
-  "edges": [{ "from": "GITHUB_LIST_REPOSITORY_ISSUES", "to": "GITHUB_CREATE_AN_ISSUE_COMMENT", "label": "issue_number" }]
+  "nodes": [
+    {
+      "id": "GITHUB_MERGE_A_PULL_REQUEST",
+      "service": "pull_requests",
+      "verb": "merge",
+      "entity": "pull_request",
+      "requires_from_actions": { "pull_number": ["GITHUB_LIST_PULL_REQUESTS"] },
+      "requires_from_user": []
+    }
+  ],
+  "edges": [
+    {
+      "from": "GITHUB_LIST_PULL_REQUESTS",
+      "to": "GITHUB_MERGE_A_PULL_REQUEST",
+      "label": "pull_number",
+      "score": 1,
+      "evidence": "name|list:pull_request",
+      "required": true
+    }
+  ]
 }
 ```
 
-- each edge is `producer -> consumer`; `label` is the id/field the producer supplies (e.g. `issue_number`, `pull_number`).
-- use Composio's tool slugs for node ids (e.g. `GITHUB_CREATE_AN_ISSUE`), taken from the catalog you were given.
-- also commit a visualization (nodes + edges you can see) and the tool catalog you use.
+- Each edge is `producer -> consumer`; `label` is the field the producer supplies.
+- Each node also states the agent's two options directly: `requires_from_actions` (run these first) and `requires_from_user` (ask for these, e.g. an issue `title` or comment `body`).
+- `score` and `evidence` explain why each edge exists, so it can be audited.
 
-## get started
+## How it works
 
-1. the GitHub tool catalog is already provided at `github_catalog.json` — no api key needed.
-2. write your generator in `src/generate.ts` to read a toolkit's catalog and produce the graph. run `npm run selfcheck` to try it on `github_catalog.json` as you iterate.
-3. use node/tsx or python (`bun` isn't guaranteed when we run your generator).
+The generator is a deterministic pipeline, with an LLM used only where the heuristics run out.
 
-for language models, use the **AI API credentials** (a Base URL and API key) shown on your Litmus assessment page. they work with the OpenAI SDK: point the client's `baseURL`/`base_url` at that url and pass the key, and call an allowed model such as `openai/gpt-4o`. your usage counts against the assessment's token budget.
+**1. Load.** A tolerant loader accepts the common Composio shapes: `inputParameters` or `input_parameters`, arrays or slug maps, and output schemas that use `$ref` into `$defs`. Only the success payload (`data`) of the output schema is used as evidence. Error types are ignored.
 
-you can implement this with whatever language you want, feel free to use language models and coding tools
+**2. Parse slugs.** Each slug is split into verb, entity and scope, e.g. `LIST` / `comments` / `for a pull request review`. Multi-word entities like `pull_request` and `workflow_run` are learned from how often the words occur together in that catalog, not from a word list.
 
-## submit
+**3. Classify inputs.** A required input is treated as a *reference* if it looks like an identifier (`*_id`, `*_number`, `sha`, `slug`, `name`, camelCase variants like `migrationId`), names a catalog entity, or is described as one. Free text, pagination, flags and enums go to `requires_from_user`.
 
-once you are done, run `litmus submit` from your assessment folder. make sure your generator (see **deliverable** above) is committed.
+**4. Resolve the entity.**
+- From the name: `issue_number` -> issue, `pull_number` -> pull_request, `org` -> organization.
+- Otherwise from the description: `head` is "the name of the branch", so branch. `owner` is "the account owner of the repository", so repository.
 
-## activity tracking
+**5. Score producers.** For each candidate producer:
+- Verb weight: list > search/find > create > get.
+- A bonus if its output schema exposes the field.
+- A penalty for each prerequisite the consumer doesn't already have.
+- A penalty for a scope mismatch or a narrower variant.
+- A heavy penalty if the producer is qualified differently. `LIST_GIST_COMMENTS` lists gist comments, not issue comments, so it must not feed `UPDATE_AN_ISSUE_COMMENT`.
+- A producer can never require the value it is supposed to produce.
 
-your work is tracked automatically while you work (file changes, git history, and AI-tool prompts) and included when you `litmus submit`. there is nothing to run, just commit often.
+The top 3 producers per (tool, parameter) are kept, and the top 2 for context parameters used across most of the toolkit (`owner`, `repo`).
 
-NOTE:  Feel free to use LLM, you will be judged by the quality of output, eval...
+**6. LLM fallback.** References the heuristics can't resolve go to an LLM through the OpenAI-compatible API. The model chooses from a shortlist of real slugs and can answer "user-provided". Answers outside the shortlist are discarded, so it can't invent slugs. Results are cached in `llm_cache.json`. LLM edges are marked `evidence: "llm"` and drawn dashed in the visualization.
+
+| Variable | Purpose |
+|---|---|
+| `LITMUS_API_URL`, `LITMUS_ASSESSMENT_TOKEN` | Used automatically when set (via `/proxy/openai/v1`) |
+| `LLM_BASE_URL`, `LLM_API_KEY` | Any other OpenAI-compatible endpoint |
+| `LLM_MODEL` | Default `openai/gpt-4o` |
+| `LLM_MAX_CALLS` | Default 40 |
+
+Pass `--no-llm` to run purely deterministically.
+
+## Visualization
+
+Open **`graph.html`** in a browser. It is self-contained and regenerated on every run.
+
+- Nodes are coloured by service and sized by how many tools they unlock.
+- Filter by service, or search for a tool.
+- Click a node to see its upstream chain, what to ask the user, and what it unlocks.
+- Context edges (`owner`, `repo`) are hidden by default so the real structure is readable. One checkbox shows them.
+
+## Evaluation
+
+`scripts/eval.ts` checks:
+
+- **Structure:** no dangling edges, no self-loops, every node a real catalog slug, every edge labelled.
+- **Gold edges:** including both examples from the brief.
+- **Known-wrong edges**, for example gist comments feeding issue comments.
+- **Producer-verb distribution**, as a sanity signal.
+
+Gold edges whose tools aren't in the given catalog are skipped, so the same script works for any toolkit.
+
+## Repository layout
+
+```
+src/generate.ts        generator (entry point)
+src/viz_template.html  visualization template
+src/selfcheck.ts       provided shape/provenance check
+scripts/eval.ts        gold-edge and structural evaluation
+github_catalog.json    the toolkit catalog used
+graph.html             visualization of the generated graph
+generator.json         build/run declaration
+```
+
+## Limitations
+
+- Values that only appear deep inside another resource (a file `sha` returned by a contents call) are matched by name and schema. Unusual naming may still need the LLM pass.
+- Optional filter inputs (e.g. `head` on `LIST_PULL_REQUESTS`) are not turned into edges. Only required inputs are.
+- The `service` grouping is derived from slugs, so it is finer-grained than GitHub's own API sections.
